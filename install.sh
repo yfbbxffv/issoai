@@ -352,22 +352,41 @@ fi
 log_ok "Toplevel evaluates successfully with hardware config"
 
 # ============================================================
-# PASSO 11: Build diskoScript do flake ANTES das confirmações
+# PASSO 11: Build diskoScript do flake ANTES das confirmações (sem 2>&1)
 # ============================================================
 log_info "Building diskoScript from flake..."
 DISKO_SCRIPT=$(nix --extra-experimental-features "nix-command flakes" \
     build .#nixosConfigurations.mypc.config.system.build.diskoScript \
-    --no-link --print-out-paths 2>&1)
+    --no-link --print-out-paths)
+
+# Valida o diskoScript
+[[ -x "$DISKO_SCRIPT" ]] || { log_err "diskoScript inválido"; mv ./disko.nix.backup ./disko.nix; exit 1; }
 log_ok "diskoScript built: $DISKO_SCRIPT"
 
 # ============================================================
-# PASSO 12: Confirmação final DESTRUTIVA
+# PASSO 12: Extrai lista de discos do próprio script e confirmação destrutiva
 # ============================================================
+WIPE_LIST=$(grep -ho '/dev/disk/by-id/[A-Za-z0-9._:+-]*' "$DISKO_SCRIPT" | sort -u)
+
+# Valida: não deve conter "SUBSTITUA" e deve ter exatamente 3 linhas
+if echo "$WIPE_LIST" | grep -q "SUBSTITUA"; then
+    log_err "diskoScript ainda contém placeholders SUBSTITUA!"
+    mv ./disko.nix.backup ./disko.nix
+    exit 1
+fi
+
+WIPE_COUNT=$(echo "$WIPE_LIST" | wc -l)
+if [[ "$WIPE_COUNT" -gt 3 ]]; then
+    log_err "diskoScript lista mais de 3 discos ($WIPE_COUNT) - abortando"
+    mv ./disko.nix.backup ./disko.nix
+    exit 1
+fi
+
 echo
 log_warn "⚠️  ATENÇÃO: ESTE PROCESSO APAGA TODOS OS DADOS NOS DISCOS:"
-echo "  - $NVME_BY_ID (sistema - NVMe ~237GB)"
-echo "  - $HDD1_BY_ID (jogos 1 - HDD ~465GB)"
-echo "  - $HDD2_BY_ID (jogos 2 - HDD ~465GB)"
+echo "$WIPE_LIST" | while IFS= read -r disk; do
+    echo "  - $disk"
+done
 echo
 read -p "Digite 'SIM' em maiúsculas para CONFIRMAR A EXCLUSÃO DE DADOS: " CONFIRM
 if [[ "$CONFIRM" != "SIM" ]]; then
@@ -377,10 +396,10 @@ if [[ "$CONFIRM" != "SIM" ]]; then
 fi
 
 # ============================================================
-# PASSO 13: Particiona, formata e monta com disko (--mode destroy,format,mount)
+# PASSO 13: Particiona, formata e monta com disko (sem argumentos)
 # ============================================================
 log_info "Running disko (destroy, format, mount)..."
-"$DISKO_SCRIPT" --mode destroy,format,mount ./disko.nix
+"$DISKO_SCRIPT"
 
 log_ok "Disks partitioned, formatted and mounted by disko"
 
