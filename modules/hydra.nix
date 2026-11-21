@@ -4,6 +4,7 @@
   # ============================================================
   # HYDRA LAUNCHER - Custom Game Launcher (Rust/Slint)
   # MÓDULO OPCIONAL - enable = false por padrão
+  # NOTA: Requer flake com hydra-launcher package
   # Ative com: config.gameos.hydra.enable = true;
   # ============================================================
 
@@ -12,8 +13,8 @@
   };
 
   config = lib.mkIf config.gameos.hydra.enable {
-    # O binário será construido pelo flake e instalado via package
-    # Aqui definimos o systemd user service
+    # O binário hydra-launcher deve estar disponível via flake
+    # Se não estiver, comente esta seção ou adicione ao flake.nix
 
     systemd.user.services.hydra-launcher = {
       description = "Hydra Game Launcher";
@@ -55,7 +56,6 @@
 
     # Variáveis de ambiente para o user session
     environment.variables = {
-      # Gamescope / Wayland
       WAYLAND_DISPLAY = "wayland-0";
       XDG_SESSION_TYPE = "wayland";
       XDG_CURRENT_DESKTOP = "gamescope";
@@ -68,12 +68,10 @@
       MOZ_ENABLE_WAYLAND = "1";
       _JAVA_AWT_WM_NONREPARENTING = "1";
 
-      # Hydra
       HYDRA_CONFIG_DIR = "/home/gamer/.config/hydra";
       HYDRA_DATA_DIR = "/home/gamer/.local/share/hydra";
       HYDRA_CACHE_DIR = "/home/gamer/.cache/hydra";
 
-      # Game paths
       HYDRA_GAMES_PATH_1 = "/games/1";
       HYDRA_GAMES_PATH_2 = "/games/2";
     };
@@ -81,7 +79,6 @@
     # Diretórios do usuário (criados no primeiro login)
     users.users.gamer = {
       extraConfig = ''
-        # XDG dirs
         XDG_CONFIG_HOME=/home/gamer/.config
         XDG_DATA_HOME=/home/gamer/.local/share
         XDG_CACHE_HOME=/home/gamer/.cache

@@ -25,12 +25,40 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-# Diretório do projeto (usa caminho relativo, não nome da pasta)
+# Diretório do projeto
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PROJECT_DIR"
 
 log_info "GameOS Installation Started"
 log_info "Project: $PROJECT_DIR"
+
+# ============================================================
+# PASSO 0: Valida flake ANTES de qualquer comando destrutivo
+# ============================================================
+log_info "Validating flake configuration..."
+
+if ! command -v nix &> /dev/null; then
+    log_err "nix command not found. Install Nix first."
+    exit 1
+fi
+
+# git safe directory
+git config --global --add safe.directory "$PROJECT_DIR" 2>/dev/null || true
+
+# Check flake syntax
+if ! nix --extra-experimental-features "nix-command flakes" flake check --no-build 2>&1; then
+    log_err "Flake check failed! Aborting."
+    exit 1
+fi
+log_ok "Flake syntax OK"
+
+# Eval toplevel drvPath to verify config builds
+log_info "Evaluating toplevel derivation..."
+if ! nix --extra-experimental-features "nix-command flakes" eval --raw .#nixosConfigurations.mypc.config.system.build.toplevel.drvPath 2>&1; then
+    log_err "Toplevel evaluation failed! Aborting."
+    exit 1
+fi
+log_ok "Toplevel evaluates successfully"
 
 # ============================================================
 # PASSO 1: Verifica hardware
@@ -54,53 +82,56 @@ if [[ ! "$GPU_MODEL" =~ "1660" ]]; then
 fi
 
 # ============================================================
-# PASSO 2: Detecta o dispositivo do Live ISO (para excluir)
+# PASSO 2: Detecta o dispositivo do Live ISO (NixOS: /iso)
 # ============================================================
 log_info "Detecting live ISO device..."
 
 LIVE_ISO_DEVICE=""
-# Tenta encontrar o dispositivo de onde o boot foi feito
-if [[ -f /proc/cmdline ]]; then
-    # Procura por boot=live ou similar
-    if grep -q "boot=live" /proc/cmdline; then
-        LIVE_ISO_DEVICE=$(findmnt -n -o SOURCE / 2>/dev/null | sed 's/\[.*//' | xargs lsblk -no PKNAME 2>/dev/null | head -1)
+# NixOS live ISO monta em /iso
+if [[ -d "/iso" ]]; then
+    ISO_SOURCE=$(findmnt -n -o SOURCE /iso 2>/dev/null | head -1)
+    if [[ -n "$ISO_SOURCE" ]]; then
+        LIVE_ISO_DEVICE=$(lsblk -no PKNAME "$ISO_SOURCE" 2>/dev/null | head -1)
+        if [[ -n "$LIVE_ISO_DEVICE" ]]; then
+            LIVE_ISO_DEVICE="/dev/$LIVE_ISO_DEVICE"
+            log_warn "Live ISO detectado em: $LIVE_ISO_DEVICE (será excluído da seleção)"
+        fi
     fi
 fi
 
-# Fallback: verifica /dev/disk/by-label para labels de live ISO
+# Fallback: verifica se /boot/efi está no USB
 if [[ -z "$LIVE_ISO_DEVICE" ]]; then
-    for label in NIXOS_INSTALL NIXOS_LIVE USB_INSTALL; do
-        if [[ -b "/dev/disk/by-label/$label" ]]; then
-            LIVE_ISO_DEVICE=$(lsblk -no PKNAME "/dev/disk/by-label/$label" 2>/dev/null | head -1)
-            break
+    EFI_SOURCE=$(findmnt -n -o SOURCE /boot/efi 2>/dev/null | head -1)
+    if [[ -n "$EFI_SOURCE" ]]; then
+        LIVE_ISO_DEVICE=$(lsblk -no PKNAME "$EFI_SOURCE" 2>/dev/null | head -1)
+        if [[ -n "$LIVE_ISO_DEVICE" ]]; then
+            LIVE_ISO_DEVICE="/dev/$LIVE_ISO_DEVICE"
+            log_warn "Live ISO (via EFI) detectado em: $LIVE_ISO_DEVICE"
         fi
-    done
+    fi
 fi
 
-if [[ -n "$LIVE_ISO_DEVICE" ]]; then
-    LIVE_ISO_DEVICE="/dev/$LIVE_ISO_DEVICE"
-    log_warn "Live ISO detectado em: $LIVE_ISO_DEVICE (será excluído da seleção)"
-else
+if [[ -z "$LIVE_ISO_DEVICE" ]]; then
     log_warn "Não foi possível detectar o dispositivo do Live ISO automaticamente"
     log_warn "Certifique-se de NÃO selecionar o USB de instalação!"
 fi
 
 # ============================================================
-# PASSO 3: Lista discos disponíveis com detalhes
+# PASSO 3: Lista discos disponíveis com validação (bytes)
 # ============================================================
-log_info "Available disks:"
+log_info "Scanning disks..."
 
-# Array para guardar discos válidos
 declare -a VALID_DISKS
 declare -a DISK_INFO
 
-# Usa lsblk para listar discos (não partições)
 while IFS= read -r line; do
     name=$(echo "$line" | awk '{print $1}')
-    size=$(echo "$line" | awk '{print $2}')
-    model=$(echo "$line" | cut -d' ' -f3- | sed 's/^ *//')
+    size_bytes=$(echo "$line" | awk '{print $2}')
+    rota=$(echo "$line" | awk '{print $3}')
+    rm_flag=$(echo "$line" | awk '{print $4}')
+    model=$(echo "$line" | cut -d' ' -f5- | sed 's/^ *//')
 
-    # Pula loop devices, rom, etc
+    # Pula loop, rom, etc
     if [[ "$name" =~ ^loop|^rom|^sr ]]; then
         continue
     fi
@@ -109,7 +140,13 @@ while IFS= read -r line; do
 
     # Pula o dispositivo do Live ISO
     if [[ -n "$LIVE_ISO_DEVICE" && "$device" == "$LIVE_ISO_DEVICE" ]]; then
-        log_disk "IGNORADO (Live ISO): $device ($size) - $model"
+        log_disk "IGNORADO (Live ISO): $device ($size_bytes bytes) - $model"
+        continue
+    fi
+
+    # Pula removíveis (RM=1)
+    if [[ "$rm_flag" == "1" ]]; then
+        log_disk "IGNORADO (Removível): $device ($size_bytes bytes) - $model"
         continue
     fi
 
@@ -117,53 +154,97 @@ while IFS= read -r line; do
     serial=$(udevadm info --query=property --name="$device" 2>/dev/null | grep 'ID_SERIAL=' | cut -d= -f2)
 
     # Pega by-id paths
-    by_id_paths=$(ls -la /dev/disk/by-id/ 2>/dev/null | grep -E " -> \.\./$name$" | awk '{print $9}' | tr '\n' ' ')
+    by_id_paths=$(ls -la /dev/disk/by-id/ 2>/dev/null | grep -E " -> \.\./$name$" | grep -v part | awk '{print $9}' | tr '\n' ' ')
 
     VALID_DISKS+=("$device")
-    DISK_INFO+=("$device|$size|$model|$serial|$by_id_paths")
+    DISK_INFO+=("$device|$size_bytes|$model|$serial|$by_id_paths|$rota")
 
     log_disk "Disco: $device"
-    log_disk "  Tamanho: $size"
+    log_disk "  Tamanho: $size_bytes bytes"
     log_disk "  Modelo:  $model"
     log_disk "  Serial:  ${serial:-N/A}"
     log_disk "  By-ID:   ${by_id_paths:-N/A}"
+    log_disk "  Rotacional: $rota"
     echo
 
-done < <(lsblk -d -n -o NAME,SIZE,MODEL 2>/dev/null)
+done < <(lsblk -d -n -o NAME,SIZE,ROTA,RM,MODEL 2>/dev/null)
 
 if [[ ${#VALID_DISKS[@]} -eq 0 ]]; then
-    log_err "Nenhum disco disponível encontrado!"
+    log_err "Nenhum disco válido encontrado!"
     exit 1
 fi
 
 # ============================================================
-# PASSO 4: Seleção interativa dos discos
+# PASSO 4: Seleção interativa com validação de tipo
 # ============================================================
 select_disk() {
     local prompt="$1"
     local var_name="$2"
-    local default="${3:-}"
+    local require_rota="$3"  # 1=HDD rotacional, 0=NVMe
+    local size_min_bytes="$4"       # bytes mínimo
+    local size_max_bytes="$5"       # bytes máximo
 
     echo
     log_warn "$prompt"
     echo "Discos disponíveis:"
     for i in "${!VALID_DISKS[@]}"; do
-        IFS='|' read -r dev size model serial by_id <<< "${DISK_INFO[$i]}"
-        echo "  [$i] $dev ($size) - $model"
+        IFS='|' read -r dev size_bytes model serial by_id rota <<< "${DISK_INFO[$i]}"
+        size_gb=$((size_bytes / 1024 / 1024 / 1024))
+
+        # Validações
+        local ok="✓"
+        local reasons=()
+        if [[ "$require_rota" == "1" && "$rota" != "1" ]]; then
+            ok="✗"
+            reasons+=("não é HDD rotacional")
+        fi
+        if [[ "$require_rota" == "0" && "$rota" == "1" ]]; then
+            ok="✗"
+            reasons+=("não é NVMe/SSD")
+        fi
+        if [[ -n "$size_min_bytes" && $size_bytes -lt $size_min_bytes ]]; then
+            ok="✗"
+            reasons+=("menor que $((size_min_bytes / 1024 / 1024 / 1024))GB")
+        fi
+        if [[ -n "$size_max_bytes" && $size_bytes -gt $size_max_bytes ]]; then
+            ok="✗"
+            reasons+=("maior que $((size_max_bytes / 1024 / 1024 / 1024))GB")
+        fi
+
+        echo "  [$i] $ok $dev ($size_gb GB) - $model [ROTA=$rota RM=0]"
+        if [[ ${#reasons[@]} -gt 0 ]]; then
+            echo "      Aviso: $(IFS=,; echo "${reasons[*]}")"
+        fi
     done
     echo
 
     while true; do
-        if [[ -n "$default" ]]; then
-            read -p "Escolha o número do disco [$default]: " choice
-            choice="${choice:-$default}"
-        else
-            read -p "Escolha o número do disco: " choice
-        fi
+        read -p "Escolha o número do disco: " choice
 
         if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 0 ]] && [[ "$choice" -lt ${#VALID_DISKS[@]} ]]; then
-            eval "$var_name=\"${VALID_DISKS[$choice]}\""
-            log_ok "Selecionado: ${VALID_DISKS[$choice]}"
+            IFS='|' read -r dev size_bytes model serial by_id rota <<< "${DISK_INFO[$choice]}"
+            size_gb=$((size_bytes / 1024 / 1024 / 1024))
+
+            # Re-valida na seleção
+            if [[ "$require_rota" == "1" && "$rota" != "1" ]]; then
+                log_err "Disco deve ser HDD rotacional (ROTA=1)"
+                continue
+            fi
+            if [[ "$require_rota" == "0" && "$rota" == "1" ]]; then
+                log_err "Disco deve ser NVMe/SSD (ROTA=0)"
+                continue
+            fi
+            if [[ -n "$size_min_bytes" && $size_bytes -lt $size_min_bytes ]]; then
+                log_err "Disco deve ter pelo menos $((size_min_bytes / 1024 / 1024 / 1024))GB"
+                continue
+            fi
+            if [[ -n "$size_max_bytes" && $size_bytes -gt $size_max_bytes ]]; then
+                log_err "Disco deve ter no máximo $((size_max_bytes / 1024 / 1024 / 1024))GB"
+                continue
+            fi
+
+            eval "$var_name=\"$dev\""
+            log_ok "Selecionado: $dev ($size_gb GB) - $model"
             break
         else
             log_err "Opção inválida. Digite um número entre 0 e $((${#VALID_DISKS[@]} - 1))"
@@ -171,9 +252,18 @@ select_disk() {
     done
 }
 
-select_disk "Selecione o NVMe (sistema ~237GB):" NVME_DISK
-select_disk "Selecione o HDD 1 (jogos ~465GB):" HDD1_DISK
-select_disk "Selecione o HDD 2 (jogos ~465GB):" HDD2_DISK
+# NVMe: não rotacional, ~237GB (aceita 200-300GB)
+NVME_MIN=$((200 * 1024 * 1024 * 1024))
+NVME_MAX=$((300 * 1024 * 1024 * 1024))
+select_disk "Selecione o NVMe (sistema ~237GB):" NVME_DISK 0 "$NVME_MIN" "$NVME_MAX"
+
+# HDD1: rotacional, 400-500GB
+HDD_MIN=$((400 * 1024 * 1024 * 1024))
+HDD_MAX=$((500 * 1024 * 1024 * 1024))
+select_disk "Selecione o HDD 1 (jogos ~465GB):" HDD1_DISK 1 "$HDD_MIN" "$HDD_MAX"
+
+# HDD2: rotacional, 400-500GB
+select_disk "Selecione o HDD 2 (jogos ~465GB):" HDD2_DISK 1 "$HDD_MIN" "$HDD_MAX"
 
 # Verifica se são discos diferentes
 if [[ "$NVME_DISK" == "$HDD1_DISK" ]] || [[ "$NVME_DISK" == "$HDD2_DISK" ]] || [[ "$HDD1_DISK" == "$HDD2_DISK" ]]; then
@@ -189,7 +279,6 @@ log_info "Converting to /dev/disk/by-id/ paths..."
 get_by_id() {
     local device="$1"
     local base=$(basename "$device")
-    # Procura o link by-id que aponta para este dispositivo
     ls -la /dev/disk/by-id/ 2>/dev/null | grep -E " -> \.\./$base$" | grep -v part | head -1 | awk '{print $9}'
 }
 
@@ -199,7 +288,7 @@ HDD2_BY_ID="/dev/disk/by-id/$(get_by_id "$HDD2_DISK")"
 
 if [[ -z "$(get_by_id "$NVME_DISK")" ]] || [[ -z "$(get_by_id "$HDD1_DISK")" ]] || [[ -z "$(get_by_id "$HDD2_DISK")" ]]; then
     log_err "Falha ao obter /dev/disk/by-id/ para algum disco"
-    log_err "Verifique se os discos têm IDs estáveis: ls -la /dev/disk/by-id/"
+    log_err "Verifique: ls -la /dev/disk/by-id/"
     exit 1
 fi
 
@@ -212,10 +301,8 @@ log_ok "HDD2 by-id: $HDD2_BY_ID"
 # ============================================================
 log_info "Updating disko.nix with device IDs..."
 
-# Cria backup
 cp ./disko.nix ./disko.nix.backup
 
-# Substitui os device IDs no disko.nix
 sed -i "s|/dev/disk/by-id/nvme-SUBSTITUA_PELO_SEU_ID_AQUI|$NVME_BY_ID|g" ./disko.nix
 sed -i "0,/ata-SUBSTITUA_PELO_SEU_ID_AQUI/s|/dev/disk/by-id/ata-SUBSTITUA_PELO_SEU_ID_AQUI|$HDD1_BY_ID|" ./disko.nix
 sed -i "s|/dev/disk/by-id/ata-SUBSTITUA_PELO_SEU_ID_AQUI|$HDD2_BY_ID|" ./disko.nix
@@ -245,9 +332,9 @@ fi
 # ============================================================
 echo
 log_warn "⚠️  ATENÇÃO: ESTE PROCESSO APAGA TODOS OS DADOS NOS DISCOS:"
-echo "  - $NVME_BY_ID (sistema - NVMe)"
-echo "  - $HDD1_BY_ID (jogos 1 - HDD)"
-echo "  - $HDD2_BY_ID (jogos 2 - HDD)"
+echo "  - $NVME_BY_ID (sistema - NVMe ~237GB)"
+echo "  - $HDD1_BY_ID (jogos 1 - HDD ~465GB)"
+echo "  - $HDD2_BY_ID (jogos 2 - HDD ~465GB)"
 echo
 read -p "Digite 'SIM' em maiúsculas para CONFIRMAR A EXCLUSÃO DE DADOS: " CONFIRM
 if [[ "$CONFIRM" != "SIM" ]]; then
@@ -257,55 +344,30 @@ if [[ "$CONFIRM" != "SIM" ]]; then
 fi
 
 # ============================================================
-# PASSO 9: Particiona e formata com disko
+# PASSO 9: Particiona, formata e monta com disko (--mode destroy,format,mount)
 # ============================================================
-log_info "Running disko (partitioning + formatting)..."
+log_info "Running disko (destroy, format, mount)..."
 
-nix --experimental-features "nix-command flakes" run github:nix-community/disko -- \
-    --mode disko \
+nix --extra-experimental-features "nix-command flakes" run github:nix-community/disko -- \
+    --mode destroy,format,mount \
     ./disko.nix
 
-log_ok "Disks partitioned and formatted"
+log_ok "Disks partitioned, formatted and mounted by disko"
 
 # ============================================================
-# PASSO 10: Monta sistemas de arquivos
-# ============================================================
-log_info "Mounting filesystems..."
-
-# Root (subvol @)
-mount -o subvol=@,compress=zstd:3,noatime,space_cache=v2,discard=async /dev/disk/by-label/NIXOS /mnt
-
-# Subvolumes
-mkdir -p /mnt/{home,nix,var/log,tmp,.snapshots,home/gamer/.cache,boot/efi,games/1,games/2}
-
-mount -o subvol=@home,compress=zstd:3,noatime,space_cache=v2,discard=async /dev/disk/by-label/NIXOS /mnt/home
-mount -o subvol=@nix,compress=zstd:3,noatime,space_cache=v2,discard=async /dev/disk/by-label/NIXOS /mnt/nix
-mount -o subvol=@log,compress=zstd:3,noatime,space_cache=v2 /dev/disk/by-label/NIXOS /mnt/var/log
-mount -o subvol=@tmp,compress=zstd:3,noatime,space_cache=v2 /dev/disk/by-label/NIXOS /mnt/tmp
-mount -o subvol=@snapshots,compress=zstd:3,noatime,space_cache=v2 /dev/disk/by-label/NIXOS /mnt/.snapshots
-mount -o subvol=@cache,compress=zstd:3,noatime,space_cache=v2 /dev/disk/by-label/NIXOS /mnt/home/gamer/.cache
-
-# EFI
-mount /dev/disk/by-label/EFI /mnt/boot/efi
-
-# Games HDDs
-mount -o compress=zstd:3,noatime,space_cache=v2,autodefrag /dev/disk/by-label/GAMES1 /mnt/games/1
-mount -o compress=zstd:3,noatime,space_cache=v2,autodefrag /dev/disk/by-label/GAMES2 /mnt/games/2
-
-log_ok "Filesystems mounted"
-
-# ============================================================
-# PASSO 11: Gera hardware-configuration.nix
+# PASSO 10: Gera hardware-configuration.nix (--no-filesystems --show-hardware-config)
 # ============================================================
 log_info "Generating hardware-configuration.nix..."
 
-nixos-generate-config --root /mnt --dir /mnt/etc/nixos/hosts/mypc
-
-# O arquivo gerado será em /mnt/etc/nixos/hosts/mypc/hardware-configuration.nix
-# Copia para o repo se quiser versionar
-cp /mnt/etc/nixos/hosts/mypc/hardware-configuration.nix ./hosts/mypc/hardware-configuration.nix
+nixos-generate-config --no-filesystems --show-hardware-config > ./hosts/mypc/hardware-configuration.nix
 
 log_ok "hardware-configuration.nix generated"
+
+# ============================================================
+# PASSO 11: git add ANTES do nixos-install
+# ============================================================
+log_info "Staging generated files..."
+git add -A
 
 # ============================================================
 # PASSO 12: Instala NixOS (flake)
@@ -332,15 +394,17 @@ log_ok "=========================================="
 echo
 log_info "Next steps:"
 echo "  1. Reboot: reboot"
-echo "  2. Login as 'gamer' (auto-login no TTY1)"
-echo "  3. Gamescope + Steam iniciam automaticamente"
-echo "  4. Para Sway fallback: Ctrl+Alt+F2 -> login -> sway --config /etc/sway/config"
-echo "  5. Ative módulos extras em configuration.nix:"
+echo "  2. Login as 'gamer' no TTY1 (auto-login)"
+echo "  3. PRIMEIRO BOOT: TTY com login - SEM gamescope"
+echo "  4. Para Sway fallback: Ctrl+Alt+F2 -> login -> sway --unsupported-gpu --config /etc/sway/config"
+echo "  5. Ative módulos depois do primeiro boot em configuration.nix:"
+echo "     config.gameos.graphics.enableGamescope = true;"
 echo "     config.gameos.gaming.enableSteam = true;"
 echo "     config.gameos.gaming.enableLutris = true;"
 echo "     config.gameos.gaming.enableHeroic = true;"
 echo "     config.gameos.gaming.enableEmulators = true;"
 echo "     config.gameos.hydra.enable = true;"
+echo "     sudo nixos-rebuild switch --flake .#mypc"
 echo
 log_warn "Se Secure Boot estiver ativo na BIOS, desative antes do primeiro boot!"
 echo
