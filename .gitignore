@@ -37,7 +37,6 @@ Cargo.lock
 *.bak
 
 # Hardware config (generated per machine)
-hosts/mypc/hardware-configuration.nix
 
 # Secrets (never commit)
 *.key
