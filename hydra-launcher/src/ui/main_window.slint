@@ -1,0 +1,442 @@
+// main_window.slint - Hydra Launcher UI (Slint)
+import { Button, Text, Image, Rectangle, Area, TouchArea, GridLayout, GridBox, Layout, VerticalLayout, HorizontalLayout, ScrollView, Window, Component, PropertyAnimation, State, States } from std-widgets.slint;
+
+export component GameItem inherits Rectangle {
+    // Modelo de dados para cada jogo na grid
+    in property <string> id;
+    in property <string> name;
+    in property <string> source;
+    in property <bool> installed;
+    in property <string> cover_path;
+    in property <string> last_played;
+
+    in property <bool> selected: false;
+    in property <bool> hovered: false;
+
+    width: 280px;
+    height: 380px;
+    background: hovered ? #2a2a3e : (selected ? #3a3a5e : #1e1e2e);
+    border-radius: 12px;
+    border-width: selected ? 2px : 0px;
+    border-color: #00d4aa;
+
+    // Cover image
+    Image {
+        x: 10px;
+        y: 10px;
+        width: 260px;
+        height: 146px;
+        source: cover_path != "" ? cover_path : "assets/covers/placeholder.png";
+        fit: cover;
+        border-radius: 8px;
+    }
+
+    // Overlay quando não instalado
+    Rectangle {
+        x: 10px;
+        y: 10px;
+        width: 260px;
+        height: 146px;
+        background: installed ? transparent : #000000aa;
+        border-radius: 8px;
+        visible: !installed;
+
+        Text {
+            text: "NOT INSTALLED";
+            color: white;
+            font-size: 18px;
+            font-weight: bold;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+
+    // Badge da fonte
+    Rectangle {
+        x: 10px;
+        y: 10px;
+        width: 80px;
+        height: 24px;
+        background: source == "Steam" ? #1b2838 : (source == "Ryujinx" || source == "Yuzu" ? #e60012 : #00d4aa);
+        border-radius: 4px;
+        Text {
+            text: source;
+            color: white;
+            font-size: 11px;
+            font-weight: bold;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+
+    // Nome do jogo
+    Text {
+        x: 10px;
+        y: 166px;
+        width: 260px;
+        height: 40px;
+        text: name;
+        color: white;
+        font-size: 16px;
+        font-weight: 600;
+        wrap: word-wrap;
+        horizontal-alignment: left;
+        vertical-alignment: top;
+    }
+
+    // Último jogado
+    Text {
+        x: 10px;
+        y: 210px;
+        width: 260px;
+        height: 20px;
+        text: last_played != "" ? "Last played: " + last_played : "Never played";
+        color: #888888;
+        font-size: 12px;
+        horizontal-alignment: left;
+    }
+
+    // Botão jogar/instalar
+    TouchArea {
+        x: 10px;
+        y: 240px;
+        width: 260px;
+        height: 48px;
+
+        Rectangle {
+            background: installed ? #00d4aa : #e60012;
+            border-radius: 8px;
+            animate background { duration: 150ms; easing: ease-out; }
+
+            Text {
+                text: installed ? "PLAY" : "INSTALL";
+                color: white;
+                font-size: 16px;
+                font-weight: bold;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+
+        clicked => {
+            if (installed) {
+                root.launch_game(id);
+            } else {
+                root.install_game(source, id);
+            }
+        }
+    }
+
+    // Horas jogadas
+    Text {
+        x: 10px;
+        y: 295px;
+        width: 260px;
+        height: 20px;
+        text: "Playtime: 0h"; // TODO: bind to metadata
+        color: #666666;
+        font-size: 11px;
+        horizontal-alignment: left;
+    }
+
+    // Avaliação (estrelas)
+    HorizontalLayout {
+        x: 10px;
+        y: 320px;
+        spacing: 4px;
+        // TODO: bind to rating
+    }
+
+    callback launch_game(string);
+    callback install_game(string, string);
+}
+
+export component MainWindow inherits Window {
+    // Configuração da janela
+    in-out property <bool> fullscreen: true;
+    title: "Hydra Launcher";
+    default-width: 1920px;
+    default-height: 1080px;
+    background: #0d0d12;
+
+    // Model de jogos
+    in property <[GameItem]> games: [];
+
+    // Filtros
+    in property <string> current_filter: "All";
+    in property <string> search_text: "";
+
+    // Estado
+    in property <bool> sidebar_open: true;
+
+    // Callbacks para Rust
+    callback refresh_games();
+    callback launch_game(string);
+    callback install_game(string, string);
+    callback quit();
+
+    // === LAYOUT PRINCIPAL ===
+    HorizontalLayout {
+        // Sidebar esquerda
+        Rectangle {
+            width: sidebar_open ? 280px : 72px;
+            min-width: 72px;
+            background: #14141e;
+            border-right: 1px solid #2a2a3e;
+
+            VerticalLayout {
+                spacing: 8px;
+                padding: 16px;
+
+                // Logo / Título
+                HorizontalLayout {
+                    spacing: 12px;
+                    Image {
+                        width: 40px;
+                        height: 40px;
+                        source: "assets/icons/hydra-logo.png";
+                    }
+                    Text {
+                        text: "HYDRA";
+                        color: #00d4aa;
+                        font-size: 22px;
+                        font-weight: bold;
+                        vertical-alignment: center;
+                        visible: sidebar_open;
+                    }
+                }
+
+                Rectangle { height: 1px; background: #2a2a3e; }
+
+                // Filtros de fonte
+                VerticalLayout {
+                    spacing: 4px;
+                    Text {
+                        text: "SOURCES";
+                        color: #666666;
+                        font-size: 11px;
+                        font-weight: bold;
+                        text-transform: uppercase;
+                        visible: sidebar_open;
+                    }
+                    ForEach(items: ["All", "Steam", "Ryujinx", "Yuzu", "Lutris", "Heroic", "RetroArch", "Manual"]) : filter_item => {
+                        TouchArea {
+                            height: 40px;
+                            Rectangle {
+                                background: filter_item == current_filter ? #00d4aa22 : transparent;
+                                border-radius: 8px;
+                                border-width: filter_item == current_filter ? 1px : 0px;
+                                border-color: #00d4aa;
+                                HorizontalLayout {
+                                    spacing: 12px;
+                                    padding: 0 12px;
+                                    Image {
+                                        width: 20px;
+                                        height: 20px;
+                                        source: filter_item == "Steam" ? "assets/icons/steam.png" :
+                                                filter_item == "Ryujinx" ? "assets/icons/ryujinx.png" :
+                                                filter_item == "Yuzu" ? "assets/icons/yuzu.png" :
+                                                filter_item == "Lutris" ? "assets/icons/lutris.png" :
+                                                filter_item == "Heroic" ? "assets/icons/heroic.png" :
+                                                filter_item == "RetroArch" ? "assets/icons/retroarch.png" :
+                                                filter_item == "Manual" ? "assets/icons/folder.png" :
+                                                "assets/icons/game.png";
+                                        color: filter_item == current_filter ? #00d4aa : #888888;
+                                    }
+                                    Text {
+                                        text: filter_item;
+                                        color: filter_item == current_filter ? #00d4aa : #cccccc;
+                                        font-size: 14px;
+                                        font-weight: filter_item == current_filter ? 600 : 400;
+                                        visible: sidebar_open;
+                                    }
+                                }
+                            }
+                            clicked => { root.current_filter = filter_item; }
+                        }
+                    }
+                }
+
+                Rectangle { height: 1px; background: #2a2a3e; margin: 16px 0; visible: sidebar_open; }
+
+                // Botões de ação
+                VerticalLayout {
+                    spacing: 8px;
+                    TouchArea {
+                        height: 44px;
+                        Rectangle {
+                            background: #1e1e2e;
+                            border-radius: 8px;
+                            border: 1px solid #2a2a3e;
+                            HorizontalLayout {
+                                spacing: 12px;
+                                padding: 0 16px;
+                                Image { width: 20px; height: 20px; source: "assets/icons/refresh.png"; color: #00d4aa; }
+                                Text { text: "Refresh Library"; color: #cccccc; font-size: 14px; visible: sidebar_open; }
+                            }
+                        }
+                        clicked => { root.refresh_games(); }
+                    }
+
+                    TouchArea {
+                        height: 44px;
+                        Rectangle {
+                            background: #1e1e2e;
+                            border-radius: 8px;
+                            border: 1px solid #2a2a3e;
+                            HorizontalLayout {
+                                spacing: 12px;
+                                padding: 0 16px;
+                                Image { width: 20px; height: 20px; source: "assets/icons/settings.png"; color: #888888; }
+                                Text { text: "Settings"; color: #888888; font-size: 14px; visible: sidebar_open; }
+                            }
+                        }
+                        clicked => { /* TODO: open settings */ }
+                    }
+
+                    TouchArea {
+                        height: 44px;
+                        Rectangle {
+                            background: #2a1a1a;
+                            border-radius: 8px;
+                            border: 1px solid #e6001244;
+                            HorizontalLayout {
+                                spacing: 12px;
+                                padding: 0 16px;
+                                Image { width: 20px; height: 20px; source: "assets/icons/power.png"; color: #e60012; }
+                                Text { text: "Exit Hydra"; color: #e60012; font-size: 14px; visible: sidebar_open; }
+                            }
+                        }
+                        clicked => { root.quit(); }
+                    }
+                }
+            }
+        }
+
+        // Área principal (direita)
+        Rectangle {
+            background: #0d0d12;
+
+            VerticalLayout {
+                padding: 24px;
+                spacing: 16px;
+
+                // Header com busca
+                HorizontalLayout {
+                    spacing: 16px;
+
+                    // Busca
+                    Rectangle {
+                        width: 400px;
+                        height: 48px;
+                        background: #1e1e2e;
+                        border-radius: 24px;
+                        border: 1px solid #2a2a3e;
+                        HorizontalLayout {
+                            spacing: 12px;
+                            padding: 0 20px;
+                            Image { width: 20px; height: 20px; source: "assets/icons/search.png"; color: #666666; }
+                            Input {
+                                text: search_text;
+                                placeholder-text: "Search games...";
+                                color: white;
+                                font-size: 16px;
+                                background: transparent;
+                                width: 100%;
+                            }
+                        }
+                    }
+
+                    // Filtro rápido (instalados/todos)
+                    HorizontalLayout {
+                        spacing: 8px;
+                        ForEach(items: ["All", "Installed", "Not Installed"]) : filter => {
+                            TouchArea {
+                                Rectangle {
+                                    width: 120px;
+                                    height: 36px;
+                                    background: filter == "All" ? #00d4aa22 : transparent;
+                                    border-radius: 18px;
+                                    border-width: filter == "All" ? 1px : 0px;
+                                    border-color: #00d4aa;
+                                    Text {
+                                        text: filter;
+                                        color: filter == "All" ? #00d4aa : #888888;
+                                        font-size: 13px;
+                                        font-weight: filter == "All" ? 600 : 400;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                                // clicked => { /* filter logic */ }
+                            }
+                        }
+                    }
+
+                    // Spacer
+                    Rectangle { background: transparent; }
+
+                    // Estatísticas
+                    HorizontalLayout {
+                        spacing: 24px;
+                        Text {
+                            text: "Total: {games.length} games";
+                            color: #888888;
+                            font-size: 14px;
+                        }
+                        Text {
+                            text: "Installed: {games.filter(g => g.installed).length}";
+                            color: #00d4aa;
+                            font-size: 14px;
+                        }
+                    }
+                }
+
+                // Grid de jogos
+                ScrollView {
+                    viewport-width: 100%;
+                    viewport-height: 100%;
+                    VerticalLayout {
+                        spacing: 16px;
+
+                        // Grid responsivo
+                        GridLayout {
+                            columns: 6; // 1920px / ~300px = ~6 columns
+                            spacing: 16px;
+                            row-spacing: 16px;
+
+                            ForEach(items: games) : game => {
+                                GameItem {
+                                    id: game.id;
+                                    name: game.name;
+                                    source: game.source;
+                                    installed: game.installed;
+                                    cover_path: game.cover_path;
+                                    last_played: game.last_played;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Input component (Slint não tem nativo, usamos Text + TouchArea)
+component Input inherits Rectangle {
+    in property <string> text: "";
+    in property <string> placeholder-text: "";
+    in property <color> color: white;
+    in property <int> font-size: 16px;
+    in property <bool> background: transparent;
+
+    Text {
+        text: text != "" ? text : placeholder-text;
+        color: text != "" ? color : #666666;
+        font-size: root.font-size;
+        horizontal-alignment: left;
+        vertical-alignment: center;
+        padding-left: 4px;
+    }
+}

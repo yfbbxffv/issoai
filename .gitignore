@@ -1,0 +1,48 @@
+# Build outputs
+result
+result-*
+*.qcow2
+*.iso
+*.img
+
+# Rust/Cargo
+target/
+Cargo.lock
+
+# Direnv
+.direnv/
+
+# Nix
+.nix-profile
+*.drv
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.vscode-*
+
+# Logs
+*.log
+
+# Backup files
+*.backup
+*.bak
+
+# Hardware config (generated per machine)
+hosts/mypc/hardware-configuration.nix
+
+# Secrets (never commit)
+*.key
+*.pem
+*.crt
+secrets.nix
+*.age
+*.sops.yaml
