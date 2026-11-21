@@ -65,8 +65,8 @@ log_ok "Toplevel evaluates successfully"
 # ============================================================
 log_info "Checking hardware..."
 
-CPU_MODEL=$(lscpu | grep "Model name" | cut -d: -f2 | xargs)
-GPU_MODEL=$(lspci | grep -i vga | cut -d: -f3- | xargs)
+CPU_MODEL=$(lscpu | grep "Model name" | cut -d: -f2 | xargs || true)
+GPU_MODEL=$(lspci | grep -i vga | cut -d: -f3- | xargs || true)
 RAM_GB=$(free -g | awk '/^Mem:/{print $2}')
 
 log_info "CPU: $CPU_MODEL"
@@ -167,7 +167,7 @@ while IFS= read -r line; do
     log_disk "  Rotacional: $rota"
     echo
 
-done < <(lsblk -d -n -o NAME,SIZE,ROTA,RM,MODEL 2>/dev/null)
+done < <(lsblk -b -d -n -o NAME,SIZE,ROTA,RM,MODEL 2>/dev/null)
 
 if [[ ${#VALID_DISKS[@]} -eq 0 ]]; then
     log_err "Nenhum disco válido encontrado!"
@@ -328,7 +328,40 @@ if [[ "$CONFIRM_DISKO" != "SIM" ]]; then
 fi
 
 # ============================================================
-# PASSO 8: Confirmação final DESTRUTIVA
+# PASSO 8: Gera hardware-configuration.nix ANTES das confirmações destrutivas
+# ============================================================
+log_info "Generating hardware-configuration.nix..."
+nixos-generate-config --no-filesystems --show-hardware-config > ./hosts/mypc/hardware-configuration.nix
+log_ok "hardware-configuration.nix generated"
+
+# ============================================================
+# PASSO 9: git add ANTES do nixos-install
+# ============================================================
+log_info "Staging generated files..."
+git add -A
+
+# ============================================================
+# PASSO 10: Re-eval toplevel.drvPath APÓS hardware-configuration.nix
+# ============================================================
+log_info "Re-evaluating toplevel derivation after hardware config..."
+if ! nix --extra-experimental-features "nix-command flakes" eval --raw .#nixosConfigurations.mypc.config.system.build.toplevel.drvPath 2>&1; then
+    log_err "Toplevel evaluation failed after hardware config! Aborting."
+    mv ./disko.nix.backup ./disko.nix
+    exit 1
+fi
+log_ok "Toplevel evaluates successfully with hardware config"
+
+# ============================================================
+# PASSO 11: Build diskoScript do flake ANTES das confirmações
+# ============================================================
+log_info "Building diskoScript from flake..."
+DISKO_SCRIPT=$(nix --extra-experimental-features "nix-command flakes" \
+    build .#nixosConfigurations.mypc.config.system.build.diskoScript \
+    --no-link --print-out-paths 2>&1)
+log_ok "diskoScript built: $DISKO_SCRIPT"
+
+# ============================================================
+# PASSO 12: Confirmação final DESTRUTIVA
 # ============================================================
 echo
 log_warn "⚠️  ATENÇÃO: ESTE PROCESSO APAGA TODOS OS DADOS NOS DISCOS:"
@@ -344,49 +377,39 @@ if [[ "$CONFIRM" != "SIM" ]]; then
 fi
 
 # ============================================================
-# PASSO 9: Particiona, formata e monta com disko (--mode destroy,format,mount)
+# PASSO 13: Particiona, formata e monta com disko (--mode destroy,format,mount)
 # ============================================================
 log_info "Running disko (destroy, format, mount)..."
-
-nix --extra-experimental-features "nix-command flakes" run github:nix-community/disko -- \
-    --mode destroy,format,mount \
-    ./disko.nix
+"$DISKO_SCRIPT" --mode destroy,format,mount ./disko.nix
 
 log_ok "Disks partitioned, formatted and mounted by disko"
 
 # ============================================================
-# PASSO 10: Gera hardware-configuration.nix (--no-filesystems --show-hardware-config)
-# ============================================================
-log_info "Generating hardware-configuration.nix..."
-
-nixos-generate-config --no-filesystems --show-hardware-config > ./hosts/mypc/hardware-configuration.nix
-
-log_ok "hardware-configuration.nix generated"
-
-# ============================================================
-# PASSO 11: git add ANTES do nixos-install
-# ============================================================
-log_info "Staging generated files..."
-git add -A
-
-# ============================================================
-# PASSO 12: Instala NixOS (flake)
+# PASSO 14: Instala NixOS (flake)
 # ============================================================
 log_info "Installing NixOS from flake..."
-
 nixos-install --flake .#mypc --no-root-passwd
 
 log_ok "NixOS installed!"
 
 # ============================================================
-# PASSO 13: Define senha do usuário gamer
+# PASSO 15: Define senha do usuário gamer
 # ============================================================
 log_info "Setting password for user 'gamer'..."
 echo "Enter password for gamer user:"
 nixos-enter --root /mnt -c "passwd gamer"
 
 # ============================================================
-# PASSO 14: Finalização
+# PASSO 16: Copia repositório para o sistema novo
+# ============================================================
+log_info "Copying repository to new system..."
+mkdir -p /mnt/home/gamer
+cp -a "$PROJECT_DIR" /mnt/home/gamer/issoai
+nixos-enter --root /mnt -c "chown -R gamer: /home/gamer"
+log_ok "Repository copied to /home/gamer/issoai"
+
+# ============================================================
+# PASSO 17: Finalização
 # ============================================================
 log_ok "=========================================="
 log_ok "  GameOS Installation Complete!"
@@ -404,10 +427,11 @@ echo "     config.gameos.gaming.enableLutris = true;"
 echo "     config.gameos.gaming.enableHeroic = true;"
 echo "     config.gameos.gaming.enableEmulators = true;"
 echo "     config.gameos.hydra.enable = true;"
-echo "     sudo nixos-rebuild switch --flake .#mypc"
+echo "     cd ~/issoai && sudo nixos-rebuild switch --flake .#mypc"
 echo
 log_warn "Se Secure Boot estiver ativo na BIOS, desative antes do primeiro boot!"
 echo
+
 read -p "Reboot now? (y/N): " REBOOT
 if [[ "$REBOOT" =~ ^[Yy]$ ]]; then
     reboot
